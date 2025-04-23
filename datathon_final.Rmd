@@ -1,0 +1,698 @@
+---
+title: "Datathon_final"
+author: "ZM"
+date: "2025-04-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(dplyr)
+library(pwr)
+library(lubridate)
+library(logistf)
+```
+
+## Read excel sheets
+```{r load data}
+file_path <- "hh_dat_anonym_svk_final.xlsx" 
+
+households <- read_excel(file_path, sheet = "Sheet1") 
+
+
+file_path_2 <- "indv_dat_anonym_svk_final.xlsx" 
+
+individuals <- read_excel(file_path_2, sheet = "Sheet1")
+```
+
+
+## calculate total number of children by enrollment
+```{r enrollment counts}
+# Filter only individuals under 18
+children_filtered <- individuals %>%
+  filter(DR_11_NUM_AGE_CAT1 %in% c("5 to 11", "12 to 17"))
+
+# Count the number of children by enrollment status
+education_enrollment_counts <- children_filtered %>%
+  group_by(E0_SS_ENROLLED_HC) %>%
+  summarize(
+    Weighted_Count = sum(country_weight, na.rm = TRUE),
+    .groups = "drop")
+
+
+education_enrollment_counts <- education_enrollment_counts %>%
+  rename(
+    "Enrollment Status" = E0_SS_ENROLLED_HC,
+    "Weighted Number of Children" = Weighted_Count)
+
+
+print(education_enrollment_counts)
+```
+
+## create indicator columns for disability levels and age
+```{r indicator columns}
+individuals <- individuals %>%
+  mutate(
+    # Disability level 2: Includes "Some difficulty," "A lot of difficulty," or "Cannot do at all"
+    disability_level_2 = if_else(WG_1_1_SS_DIFF_SEE %in% c("some_difficulty", "lot_difficulty", "cannot_all") |
+                                WG_1_2_SS_DIFF_HEAR %in% c("some_difficulty", "lot_difficulty", "cannot_all") |
+                                WG_1_3_SS_DIFF_WALK %in% c("some_difficulty", "lot_difficulty", "cannot_all") |
+                                WG_1_4_SS_DIFF_REM %in% c("some_difficulty", "lot_difficulty", "cannot_all") |
+                                WG_1_5_SS_DIFF_DRESS %in% c("some_difficulty", "lot_difficulty", "cannot_all") |
+                                WG_1_6_SS_DIFF_COMM %in% c("some_difficulty", "lot_difficulty", "cannot_all"), 1, 0),
+
+    # Disability level 3: Includes "A lot of difficulty" or "Cannot do at all"
+   disability_level_3 = if_else(WG_1_1_SS_DIFF_SEE %in% c("lot_difficulty", "cannot_all") |
+                                WG_1_2_SS_DIFF_HEAR %in% c("lot_difficulty", "cannot_all") |
+                                WG_1_3_SS_DIFF_WALK %in% c("lot_difficulty", "cannot_all") |
+                                WG_1_4_SS_DIFF_REM %in% c("lot_difficulty", "cannot_all") |
+                                WG_1_5_SS_DIFF_DRESS %in% c("lot_difficulty", "cannot_all") |
+                                WG_1_6_SS_DIFF_COMM %in% c("lot_difficulty", "cannot_all"), 1, 0)
+  )
+
+
+
+# Identify Children and Adults Based on Age Categories
+individuals_categorized <- individuals %>%
+  mutate(
+    is_child = ifelse(DR_11_NUM_AGE_CAT1 %in% c("0 to 4", "5 to 11", "12 to 17"), 1, 0),
+    is_adult = ifelse(!DR_11_NUM_AGE_CAT1 %in% c("0 to 4", "5 to 11", "12 to 17"), 1, 0)
+  )
+
+```
+
+
+# -----------------------------------------------------------------------------
+# PREPARATION FOR ANALYSIS
+# -----------------------------------------------------------------------------
+
+## Cleaning and preparation of Individuals data
+```{r prep individuals}
+
+survey_date <- as.Date("2024-07-01", format = "%Y-%m-%d")
+
+
+# Select relevant columns from individuals data set
+individuals_selected <- individuals %>%
+    filter(DR_11_NUM_AGE_CAT1 %in% c("5 to 11", "12 to 17")) %>%  # Keep only children
+    filter(E0_SS_ENROLLED_HC %in% c("yes", "no")) %>%  # Include only "yes" and "no" for enrollment
+  select(
+    unique_hh_index,
+    gender = DR_12_SS_GEN,
+    disability_level_3,
+    disability_level_2,
+    chronic_illness = H2_SS_HLTH_CHRONIC_ILL,
+    psychological_issues = H11_SS_PSY,
+    health_problem = H1_SS_HLTH_PBLM,
+    language_skills = E0_SS_LANG_KNOWLEDGE,
+    age = DR_11_NUM_AGE_CAT1,
+    age2 = DR_11_NUM_AGE_CAT2,
+    arrival_date = DR_15_NUM_INHC,
+    E0_SS_ENROLLED_HC,
+    individual_weight = country_weight,
+
+  ) %>%
+  mutate(
+    
+    # Health categorization
+    health_issue = case_when(
+      disability_level_3 == 1 | chronic_illness == "yes" | psychological_issues == "yes" | health_problem == "yes" ~ "yes",
+      TRUE ~ "no"
+    ),
+
+    # Language skills grouping
+    language_skills = case_when(
+      language_skills %in% c("does_not_understand", "beginner", "intermediate") ~ "Low",
+      language_skills %in% c("advanced", "fluent") ~ "High",
+      TRUE ~ "Missing"
+    ),
+
+     # Convert arrival date to Date format
+    arrival_date = as.Date(arrival_date, format = "%d.%m.%Y"),
+
+    # Arrival Date Grouping (based on survey date)
+   arrival_group = case_when(
+  is.na(arrival_date) ~ NA_character_,  # Keep NA values as NA
+  arrival_date >= survey_date - months(6)  ~ "In past 6 months",
+  arrival_date >= survey_date - months(12) ~ "In past 1 year",
+  arrival_date >= survey_date - months(24) ~ "In past 2 years",
+  arrival_date >= survey_date - months(36) ~ "In past 3 years",
+  TRUE ~ "Before past 3 years"
+)
+  )
+
+
+```
+
+## preparing HH head employment column
+```{r}
+# Identify Household Heads from individuals with all relevant employment-related variables
+household_heads_raw <- individuals %>%
+  filter(DR_16_SS_LEAD_HH == "yes") %>%
+  select(
+    unique_hh_index,
+    DR_12_SS_GEN,
+    SE2_SS_WORK,
+    SE3_SS_BUSINESS,
+    SE4_SS_FAM_BUSINESS,
+    SE5_SS_HELP_FAM_BUSINESS,
+    SE6_SS_TRY_FIND_JOB,
+    SE7_SS_START_WORK_IN_2_WKS
+  )
+
+```
+
+
+## Preparing columns with information on the head of HH 
+```{r prep hh head}
+# Identify household heads
+household_heads_all <- individuals %>%
+  select(
+    unique_hh_index, iteration_hh, DR_16_SS_LEAD_HH,
+    DR_12_SS_GEN, DR_11_NUM_AGE_CAT1, DR_11_NUM_AGE_CAT1,
+    SE2_SS_WORK, SE3_SS_BUSINESS, SE4_SS_FAM_BUSINESS, SE5_SS_HELP_FAM_BUSINESS
+  )
+
+# Get household-level summaries of HH head responses
+hh_head_flags <- household_heads_all %>%
+  group_by(unique_hh_index) %>%
+  mutate(
+    num_yes = sum(DR_16_SS_LEAD_HH == "yes", na.rm = TRUE),
+    
+    # All said no or unsure (no one said yes)
+    all_non_yes = all(DR_16_SS_LEAD_HH %in% c("no", "prefer_not_answer", "don't_know", NA)),
+
+    pick_head = case_when(
+      DR_16_SS_LEAD_HH == "yes" & num_yes == 1 ~ TRUE,                          # Single "yes"
+      DR_16_SS_LEAD_HH == "yes" & iteration_hh == 1 ~ TRUE,                     # Multiple "yes", pick iter 1
+      all_non_yes & iteration_hh == 1 ~ TRUE,                                   # All not yes, take iter 1
+      TRUE ~ FALSE
+    )
+  ) %>%
+  filter(pick_head) %>%  # Keep only selected HH head per logic above
+  ungroup()
+
+# Compute Employment & Gender
+household_heads <- hh_head_flags %>%
+  mutate(
+    HH_Head_Gender = DR_12_SS_GEN,
+
+    HH_Head_Employment = case_when(
+      # Employed if yes to any relevant work question
+      SE2_SS_WORK == "yes" | SE3_SS_BUSINESS == "yes" |
+      SE4_SS_FAM_BUSINESS == "yes" | SE5_SS_HELP_FAM_BUSINESS == "yes" ~ "Employed",
+
+      # Combine "Non-working age" and "Unemployed/Outside" into one category
+      (DR_11_NUM_AGE_CAT1 == "60+" &
+        is.na(SE2_SS_WORK) & is.na(SE3_SS_BUSINESS) &
+        is.na(SE4_SS_FAM_BUSINESS) & is.na(SE5_SS_HELP_FAM_BUSINESS)) |
+      (SE2_SS_WORK == "no" & SE3_SS_BUSINESS == "no" &
+        SE4_SS_FAM_BUSINESS == "no" & SE5_SS_HELP_FAM_BUSINESS == "no") ~
+        "Unemployed/Outside/non-working-age",
+
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(unique_hh_index, HH_Head_Gender, HH_Head_Employment)
+
+
+households_updated <- households %>%
+  left_join(household_heads, by = "unique_hh_index")
+
+```
+
+
+
+## Preparing columns with information on the HH compositions - region and amount of adults + compile information on HH level
+
+```{r hh composition}
+household_regions <- households %>%
+  mutate(
+    Regions = case_when(
+      INT04_SS_LOC_ADM1 %in% c("trnavsky", "trenciansky", "nitriansky", "bratislavsky") ~ "West",
+      INT04_SS_LOC_ADM1 %in% c("zilinsky", "banskobystricky") ~ "Central",
+      INT04_SS_LOC_ADM1 %in% c("presovsky", "kosicky") ~ "East",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  select(unique_hh_index, Regions)
+
+# Identify Adults in Each Household
+household_adult_counts <- individuals %>%
+  mutate(
+    is_adult = ifelse(!DR_11_NUM_AGE_CAT1 %in% c("0 to 4", "5 to 11", "12 to 17"), 1, 0)  # Identify adults
+  ) %>%
+  group_by(unique_hh_index) %>%
+  summarize(
+    total_adults = sum(is_adult, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    hh_composition = case_when(
+    total_adults == 1 ~ "One Adult",
+    total_adults > 1 ~ "More Adults",
+    TRUE ~ "No Adults"  # If no adults, specify category
+  )
+  )
+
+# Merge Household Composition Info with Households Data
+households_selected <- households %>%
+  left_join(household_heads, by = "unique_hh_index") %>%  # Use preprocessed HH head info
+  left_join(household_adult_counts, by = "unique_hh_index") %>%  # Add HH composition
+    left_join(household_regions, by = "unique_hh_index") %>%  # Merged region grouping here
+  select(
+    unique_hh_index,
+    accommodation = SHL01_1_SS_ACCOM_ARR,
+    hh_head_gender = HH_Head_Gender,  # Already processed in household_heads
+    bank_account = L12_SS_HV_BNK_ACC,
+    hostile_behaviour = SC3_SS_EXP_HOSTILE,
+    feeling_safe = PRT06_SS_SAFETY_LVL,
+    hh_head_employment = HH_Head_Employment,  # Already processed in household_heads
+    risk_girls = CP02_SM_RISK_G,
+    risk_boys = CP01_SM_RISK_B,
+    hh_composition,
+    hh_weight = country_weight,
+    Regions
+  ) %>%
+  mutate(
+    # Accommodation grouping
+    accommodation = case_when(
+      accommodation %in% c("full_payment_by_household") ~ "Full payment by HH",
+      accommodation %in% c("partial_payment_by_household", "partial_payment_by_household_sub_ngo", "partial_subsidized_by_emp", "partial_payment_hosted", "partial_payment_hosted_unrelated") ~ "Partial payment by HH",
+      accommodation %in% c("no_payment_free_government", "no_payment_free_hosted", "no_payment_subsidized_by_emp") ~ "No payment by HH",
+      TRUE ~ NA_character_
+    ),
+ # bank account
+    bank_account = case_when(
+      bank_account == "yes" ~ "yes",
+      bank_account == "no" ~ "no",
+      TRUE ~ NA_character_
+    ),
+ 
+  # hostile behaviour
+    hostile_behaviour = case_when(
+      hostile_behaviour == "yes" ~ "yes",
+      hostile_behaviour == "no" ~ "no",
+      TRUE ~ "Other"
+    ),
+
+    # Safety Level
+    feeling_safe = case_when(
+      feeling_safe %in% c("very_safe", "fairly_safe") ~ "yes",
+      feeling_safe %in% c("bit_unsafe", "very_unsafe") ~ "no",
+      TRUE ~ "Other"
+    ),
+
+  combined_risk = case_when(
+  risk_girls == "no_concerns" | risk_boys == "no_concerns" ~ "No Risks",
+  !is.na(risk_girls) & risk_girls != "no_concerns" ~ "Other Risks",
+  !is.na(risk_boys) & risk_boys != "no_concerns" ~ "Other Risks",
+  is.na(risk_girls) & is.na(risk_boys) ~ NA_character_
+)
+
+  )
+
+# View the Updated Dataset
+print(head(households_selected))
+
+```
+
+## Merge datasets
+
+```{r merge}
+# Merge datasets
+A_clean_data <- individuals_selected %>%
+  left_join(households_selected, by = "unique_hh_index")
+
+# View the transformed dataset
+print(head(A_clean_data))
+
+```
+
+
+
+
+# -----------------------------------------------------------------------------
+# MULTIVARIATE LOGISTIC REGRESSION
+# -----------------------------------------------------------------------------
+
+```{r}
+model <- glm(E0_SS_ENROLLED_HC ~ gender + language_skills + combined_risk + hostile_behaviour + health_issue + Regions  + accommodation + hh_head_gender + bank_account  + feeling_safe + hh_head_employment  + hh_composition, 
+             data = A_clean_data, 
+             family = binomial)
+summary(model)
+
+```
+c sample needed for medium effectr size
+
+
+```{r}
+pwr.f2.test(u = 12,       
+            v = NULL,     
+            f2 = 0.15,    
+            sig.level = 0.05,
+            power = 0.80)
+```
+
+
+
+# -----------------------------------------------------------------------------
+# DESCRIPTIVE TABLES
+# -----------------------------------------------------------------------------
+
+
+## Calculate enrollment percentage by gender of the child
+
+```{r gender}
+
+enrollment_gender <- A_clean_data %>%
+    filter(!is.na(gender) & !is.na(E0_SS_ENROLLED_HC)) %>%  # Remove NA rows
+  group_by(gender, E0_SS_ENROLLED_HC) %>%
+  summarize(
+    Weighted_Count = sum(individual_weight),  # Apply weights
+    .groups = "drop"
+  ) %>%
+  group_by(gender) %>%  
+  mutate(
+    Percentage = (Weighted_Count / sum(Weighted_Count)) * 100
+  ) %>%
+  select(gender, E0_SS_ENROLLED_HC, Weighted_Count, Percentage) %>%
+  pivot_wider(names_from = E0_SS_ENROLLED_HC, values_from = c(Weighted_Count, Percentage), 
+              names_glue = "{E0_SS_ENROLLED_HC}_{.value}")
+
+# View the table
+print(enrollment_gender)
+```
+
+## Calculate enrollment percentage by health status of child 
+
+```{r health}
+
+enrollment_grouped_health <- A_clean_data %>%
+  group_by(health_issue, E0_SS_ENROLLED_HC) %>%
+  summarize(
+    Weighted_Count = sum(individual_weight),  # Apply weights
+    .groups = "drop"
+  ) %>%
+  group_by(health_issue) %>%  
+  mutate(
+    Percentage = (Weighted_Count / sum(Weighted_Count)) * 100
+  ) %>%
+  select(health_issue, E0_SS_ENROLLED_HC, Weighted_Count, Percentage) %>%
+  pivot_wider(names_from = E0_SS_ENROLLED_HC, values_from = c(Weighted_Count, Percentage), 
+              names_glue = "{E0_SS_ENROLLED_HC}_{.value}")
+
+# View the table
+print(enrollment_grouped_health)
+```
+## Calculate enrollment percentage by accommodation payment arrangements by Household
+
+```{r accommodation}
+# accommodation payment arragngement-related analysis
+enrollment_accomm <- A_clean_data %>%
+  group_by(accommodation, E0_SS_ENROLLED_HC) %>%
+  filter(!is.na(accommodation) & !is.na(E0_SS_ENROLLED_HC)) %>%  # Remove NA rows
+  summarize(
+    Weighted_Count = sum(individual_weight),  # Apply weights
+    .groups = "drop"
+  ) %>%
+  group_by(accommodation) %>%  
+  mutate(
+    Percentage = (Weighted_Count / sum(Weighted_Count)) * 100
+  ) %>%
+  select(accommodation, E0_SS_ENROLLED_HC, Weighted_Count, Percentage) %>%
+  pivot_wider(names_from = E0_SS_ENROLLED_HC, values_from = c(Weighted_Count, Percentage), 
+              names_glue = "{E0_SS_ENROLLED_HC}_{.value}")
+
+# View the table
+print(enrollment_accomm)
+```
+
+## Calculate enrollment percentage by language skill of the child
+
+```{r language}
+enrollment_language <- A_clean_data %>%
+  group_by(language_skills, E0_SS_ENROLLED_HC) %>%
+  filter(!is.na(language_skills) & !is.na(E0_SS_ENROLLED_HC)) %>%  # Remove NA rows
+  summarize(
+    Weighted_Count = sum(individual_weight),  # Apply weights
+    .groups = "drop"
+  ) %>%
+  group_by(language_skills) %>%  
+  mutate(
+    Percentage = (Weighted_Count / sum(Weighted_Count)) * 100
+  ) %>%
+  select(language_skills, E0_SS_ENROLLED_HC, Weighted_Count, Percentage) %>%
+  pivot_wider(names_from = E0_SS_ENROLLED_HC, values_from = c(Weighted_Count, Percentage), 
+              names_glue = "{E0_SS_ENROLLED_HC}_{.value}")
+
+# View the table
+print(enrollment_language)
+```
+
+## Calculate enrollment percentage by gender of the Head of HH
+
+```{r hh head gender}
+
+enrollment_hh_head <- A_clean_data %>%
+  group_by(hh_head_gender, E0_SS_ENROLLED_HC) %>%
+  filter(!is.na(hh_head_gender) & !is.na(E0_SS_ENROLLED_HC)) %>%  # Remove NA rows
+  summarize(
+    Weighted_Count = sum(individual_weight),  # Apply weights
+    .groups = "drop"
+  ) %>%
+  group_by(hh_head_gender) %>%  
+  mutate(
+    Percentage = (Weighted_Count / sum(Weighted_Count)) * 100
+  ) %>%
+  select(hh_head_gender, E0_SS_ENROLLED_HC, Weighted_Count, Percentage) %>%
+  pivot_wider(names_from = E0_SS_ENROLLED_HC, values_from = c(Weighted_Count, Percentage), 
+              names_glue = "{E0_SS_ENROLLED_HC}_{.value}")
+
+# View the table
+print(enrollment_hh_head)
+```
+## Calculate enrollment percentage by HH composition
+
+```{r hh compostion}
+enrollment_hh_composition <- A_clean_data %>%
+  group_by(hh_composition, E0_SS_ENROLLED_HC) %>%
+  summarize(
+    Weighted_Count = sum(individual_weight),  # Apply weights
+    .groups = "drop"
+  ) %>%
+  group_by(hh_composition) %>%  
+  mutate(
+    Percentage = (Weighted_Count / sum(Weighted_Count)) * 100
+  ) %>%
+  select(hh_composition, E0_SS_ENROLLED_HC, Weighted_Count, Percentage) %>%
+  pivot_wider(names_from = E0_SS_ENROLLED_HC, values_from = c(Weighted_Count, Percentage), 
+              names_glue = "{E0_SS_ENROLLED_HC}_{.value}")
+
+# View the table
+print(enrollment_hh_composition)
+```
+
+## Calculate enrollment percentage by employment status of the head of HH
+
+```{r hh employment}
+
+# employment of head of household-related analysis
+enrollment_hh_employment <- A_clean_data %>%
+    filter(!is.na(hh_head_employment) & !is.na(E0_SS_ENROLLED_HC)) %>%  # Remove NA rows
+  group_by(hh_head_employment, E0_SS_ENROLLED_HC) %>%
+  summarize(
+    Weighted_Count = sum(individual_weight),  # Apply weights
+    .groups = "drop"
+  ) %>%
+  group_by(hh_head_employment) %>%  
+  mutate(
+    Percentage = (Weighted_Count / sum(Weighted_Count)) * 100
+  ) %>%
+  select(hh_head_employment, E0_SS_ENROLLED_HC, Weighted_Count, Percentage) %>%
+  pivot_wider(names_from = E0_SS_ENROLLED_HC, values_from = c(Weighted_Count, Percentage), 
+              names_glue = "{E0_SS_ENROLLED_HC}_{.value}")
+
+# View the table
+print(enrollment_hh_employment)
+```
+
+## Calculate enrollment percentage by wether the head of HH has a bank account
+
+```{r bank}
+enrollment_hh_bank <- A_clean_data %>%
+    filter(!is.na(bank_account) & !is.na(E0_SS_ENROLLED_HC)) %>%  # Remove NA rows
+  group_by(bank_account, E0_SS_ENROLLED_HC) %>%
+  summarize(
+    Weighted_Count = sum(individual_weight),  # Apply weights
+    .groups = "drop"
+  ) %>%
+  group_by(bank_account) %>%  
+  mutate(
+    Percentage = (Weighted_Count / sum(Weighted_Count)) * 100
+  ) %>%
+  select(bank_account, E0_SS_ENROLLED_HC, Weighted_Count, Percentage) %>%
+  pivot_wider(names_from = E0_SS_ENROLLED_HC, values_from = c(Weighted_Count, Percentage), 
+              names_glue = "{E0_SS_ENROLLED_HC}_{.value}")
+
+# View the table
+print(enrollment_hh_bank)
+```
+
+## Calculate enrollment percentage by households experiences of hostile behaviour from host community 
+ 
+```{r hositle behaviour}
+enrollment_hh_hostile <- A_clean_data %>%
+    filter(!is.na(hostile_behaviour) & !is.na(E0_SS_ENROLLED_HC)) %>%  # Remove NA rows
+  group_by(hostile_behaviour, E0_SS_ENROLLED_HC) %>%
+  summarize(
+    Weighted_Count = sum(individual_weight),  # Apply weights
+    .groups = "drop"
+  ) %>%
+  group_by(hostile_behaviour) %>%  
+  mutate(
+    Percentage = (Weighted_Count / sum(Weighted_Count)) * 100
+  ) %>%
+  select(hostile_behaviour, E0_SS_ENROLLED_HC, Weighted_Count, Percentage) %>%
+  pivot_wider(names_from = E0_SS_ENROLLED_HC, values_from = c(Weighted_Count, Percentage), 
+              names_glue = "{E0_SS_ENROLLED_HC}_{.value}")
+
+# View the table
+print(enrollment_hh_hostile)
+```
+
+## Calculate enrollment percentage by households percieved feelings of safety in their neighbourhood
+
+```{r safety}
+
+enrollment_hh_safety <- A_clean_data %>%
+    filter(!is.na(feeling_safe) & !is.na(E0_SS_ENROLLED_HC)) %>%  # Remove NA rows
+  group_by(feeling_safe, E0_SS_ENROLLED_HC) %>%
+  summarize(
+    Weighted_Count = sum(individual_weight),  # Apply weights
+    .groups = "drop"
+  ) %>%
+  group_by(feeling_safe) %>%  
+  mutate(
+    Percentage = (Weighted_Count / sum(Weighted_Count)) * 100
+  ) %>%
+  select(feeling_safe, E0_SS_ENROLLED_HC, Weighted_Count, Percentage) %>%
+  pivot_wider(names_from = E0_SS_ENROLLED_HC, values_from = c(Weighted_Count, Percentage), 
+              names_glue = "{E0_SS_ENROLLED_HC}_{.value}")
+
+# View the table
+print(enrollment_hh_safety)
+```
+
+
+## Calculate enrollment percentage by wether househols percieve any risks to children
+
+```{r risk children}
+enrollment_risk <- A_clean_data %>%
+    filter(!is.na(combined_risk) & !is.na(E0_SS_ENROLLED_HC)) %>%  # Remove NA rows
+  group_by(combined_risk, E0_SS_ENROLLED_HC) %>%
+  summarize(
+    Weighted_Count = sum(individual_weight),  # Apply weights
+    .groups = "drop"
+  ) %>%
+  group_by(combined_risk) %>%  
+  mutate(
+    Percentage = (Weighted_Count / sum(Weighted_Count)) * 100
+  ) %>%
+  select(combined_risk, E0_SS_ENROLLED_HC, Weighted_Count, Percentage) %>%
+  pivot_wider(names_from = E0_SS_ENROLLED_HC, values_from = c(Weighted_Count, Percentage), 
+              names_glue = "{E0_SS_ENROLLED_HC}_{.value}")
+
+# View the table
+print(enrollment_risk)
+```
+
+
+## Calculate enrollment percentage by household region of residence
+
+```{r hh region}
+# Extract Region Information from Households Data
+household_regions <- households %>%
+  select(unique_hh_index, Region = INT04_SS_LOC_ADM1)  # Keep only necessary columns
+
+#  Merge Region Data with Individuals Data
+children_region_enroll <- individuals %>%
+  filter(E0_SS_ENROLLED_HC %in% c("yes", "no")) %>%
+  left_join(household_regions, by = "unique_hh_index")  # Add region info to each child
+
+# Count Enrollment Status by Region
+enrollment_by_region <- children_region_enroll %>%
+  filter(!is.na(Region)) %>%  # Ensure region data is available
+  group_by(Region, E0_SS_ENROLLED_HC) %>%
+  summarize(
+     Weighted_Count = sum(country_weight),  # Apply weights
+    .groups = "drop"
+  ) %>%
+  group_by(Region) %>%
+  mutate(
+    Percentage = (Weighted_Count / sum(Weighted_Count)) * 100
+  ) %>%
+  pivot_wider(
+    names_from = E0_SS_ENROLLED_HC,
+    values_from = c(Weighted_Count, Percentage),
+    names_prefix = "Enrolled_"
+  )
+
+# View the Final Table
+print(enrollment_by_region)
+
+```
+
+## Calculate enrollment percentage by region of household - grouping regions ino east, west and central Slovakia
+
+```{r hh region grouped}
+# Extract and Group Region Information from Households Data
+household_regions <- households %>%
+  mutate(
+    Grouped_Region = case_when(
+      INT04_SS_LOC_ADM1 %in% c("trnavsky", "trenciansky", "nitriansky", "bratislavsky") ~ "West",
+      INT04_SS_LOC_ADM1 %in% c("zilinsky", "banskobystricky") ~ "Central",
+      INT04_SS_LOC_ADM1 %in% c("presovsky", "kosicky") ~ "East",
+      
+      TRUE ~ NA_character_  # Keep NA for missing/other regions
+    )
+  ) %>%
+  select(unique_hh_index, Grouped_Region)
+
+# Merge Grouped Region Data with Individuals Data
+children_region_enroll <- individuals %>%
+  filter( E0_SS_ENROLLED_HC %in% c("yes", "no")) %>%
+  left_join(household_regions, by = "unique_hh_index")  # Add grouped region info to each child
+
+# =Count Enrollment Status by Grouped Region 
+enrollment_by_region <- children_region_enroll %>%
+  filter(!is.na(Grouped_Region)) %>% 
+  group_by(Grouped_Region, E0_SS_ENROLLED_HC) %>%
+  summarize(
+     Weighted_Count = sum(country_weight),  # Apply weights
+    .groups = "drop"
+  ) %>%
+  group_by(Grouped_Region) %>%
+  mutate(
+    Percentage = (Weighted_Count / sum(Weighted_Count)) * 100
+  ) %>%
+  pivot_wider(
+    names_from = E0_SS_ENROLLED_HC,
+    values_from = c(Weighted_Count, Percentage),
+    names_prefix = "Enrolled_"
+  )
+
+# View the Final Table
+print(enrollment_by_region)
+
+```
+
+
+
