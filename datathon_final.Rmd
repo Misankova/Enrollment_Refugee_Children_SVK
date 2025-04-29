@@ -5,11 +5,9 @@ date: "2025-04-01"
 output: html_document
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-```
-
 ## Libraries
+
+
 
 ```{r}
 library(tidyverse)
@@ -18,6 +16,11 @@ library(dplyr)
 library(pwr)
 library(lubridate)
 library(logistf)
+library(ggplot2)
+library(broom)
+library(ggeffects)
+library(effects)
+library(sjPlot)
 ```
 
 ## Read excel sheets
@@ -337,6 +340,11 @@ print(head(A_clean_data))
 ```
 
 
+```{r}
+A_clean_data$E0_SS_ENROLLED_HC <- ifelse(A_clean_data$E0_SS_ENROLLED_HC == "yes", 1,
+                                   ifelse(A_clean_data$E0_SS_ENROLLED_HC == "no", 0, NA))
+
+```
 
 
 # -----------------------------------------------------------------------------
@@ -350,7 +358,29 @@ model <- glm(E0_SS_ENROLLED_HC ~ gender + language_skills + combined_risk + host
 summary(model)
 
 ```
-c sample needed for medium effectr size
+# interpretations of odds ratios
+
+```{r}
+results <- tidy(model) %>% 
+  filter(term != "(Intercept)") 
+
+results_clean <- results %>%
+  mutate(
+    odds_ratio = exp(estimate),
+    interpretation = case_when(
+      odds_ratio > 1 ~ paste0(round(odds_ratio, 2), " times more likely (", round((odds_ratio - 1) * 100, 1), "% more likely)"),
+      odds_ratio < 1 ~ paste0(round(1 / odds_ratio, 2), " times less likely (", round((1 - odds_ratio) * 100, 1), "% less likely)"),
+      TRUE ~ "No difference"
+    )
+  )
+
+
+print(results_clean)
+```
+
+
+
+# sample needed for medium effectr size
 
 
 ```{r}
@@ -359,6 +389,110 @@ pwr.f2.test(u = 12,
             f2 = 0.15,    
             sig.level = 0.05,
             power = 0.80)
+```
+
+```{r}
+
+# Tidy up the model
+model_tidy <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+
+
+```
+
+
+```{r}
+# First: make a cleaner version of your predictors
+model_tidy_clean <- model_tidy %>%
+  filter(term != "(Intercept)") %>%
+  mutate(term_clean = case_when(
+    term == "bank_accountyes" ~ "Bank Account in HH",
+    term == "gendermale" ~ "Male Gender",
+    term == "hostile_behaviouryes" ~ "Experienced Hostile Behaviour",
+    term == "accommodationNo payment by HH" ~ "No payment for accommodation by HH",
+    term == "feeling_safeOther" ~ "Feeling safe - N/A",
+    term == "RegionsWest" ~ "HH in the West region",
+    term == "feeling_safeyes" ~ "Feeling safe in the neighbourhood",
+    term == "hh_head_employmentUnemployed/Outside/non-working-age" ~ "Unemployed head of HH",
+    term == "combined_riskOther Risks" ~ "Risks for children identified",
+    term == "hh_compositionOne Adult" ~ "One adult in the HH",
+    term == "RegionsEast" ~ "HH in the East region",
+    term == "health_issueyes" ~ "Child with health issues",
+    term == "language_skillsMissing" ~ "Missing info on language proficiency",
+    term == "hostile_behaviourOther" ~ "Hostile behaviour - N/A",
+    term == "accommodationPartial payment by HH" ~ "Partial accomodation payment by HH",
+    term == "language_skillsLow" ~ "Low language proficiency",
+    term == "hh_head_gendermale" ~ "Male head of HH",
+    # Add more mappings here for all your predictors
+    TRUE ~ term  # fallback if no match
+  ))
+```
+
+
+
+# -----------------------------------------------------------------------------
+# GRAPHICS
+# -----------------------------------------------------------------------------
+
+#ffde59 - yellow
+#0c70bc - blue 
+
+```{r}
+
+
+# Then plot
+ggplot(model_tidy_clean, aes(x = reorder(term_clean, estimate), y = estimate)) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2, color = "#ffde59", size = 1) +
+  geom_point(color = "black", size = 2) + 
+  geom_hline(yintercept = 1, linetype = "dashed", color = "#ff5757", size = 1) + 
+  coord_flip() +
+  labs(
+    title = "Odds Ratios from Logistic Regression",
+    x = "Predictors",
+    y = "Odds Ratio (95% CI)"
+  ) +
+  theme_minimal(base_family = "sans") +
+  theme(
+    plot.background = element_rect(fill = "#0c70bc", color = NA),  # Background blue
+    panel.background = element_rect(fill = "#0c70bc", color = NA), # Panel blue
+    panel.grid = element_blank(),  # Remove grid lines 
+    axis.text = element_text(color = "white"),
+    axis.title = element_text(color = "white"),
+    plot.title = element_text(color = "white", face = "bold"),
+    axis.line = element_line(color = "white")
+  )
+```
+
+
+
+```{r}
+# Plot the odds ratios
+ggplot(model_tidy[model_tidy$term != "(Intercept)", ], aes(x = reorder(term, estimate), y = estimate)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  coord_flip() +
+  labs(
+    title = "Odds Ratios from Logistic Regression",
+    x = "Predictors",
+    y = "Odds Ratio (95% CI)"
+  ) +
+  theme_minimal()
+
+```
+```{r}
+# Tidy up the model output
+model_tidy <- broom::tidy(model, conf.int = TRUE)
+
+# Plot
+ggplot(model_tidy, aes(x = estimate, y = reorder(term, estimate))) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Logistic Regression Coefficients",
+       x = "Estimate (log-odds)",
+       y = "Predictors") +
+  theme_minimal()
+
 ```
 
 
